@@ -2,29 +2,32 @@
 Pollution sensor module connected by ESP32-Bluetooth to a smartphone Aircasting app
 
 
-* Hardware
+## Hardware
 - ESP32 devkitC
 - DS18B20+ : Temperature sensor through 1-wire
 - DSM501 : Particule sensor
 - TGS2611 : NO2 Methane sensor (analog)
 
-* Software for ESP32
+## Software for ESP32
  - Bluetooth connexion using internal module and SPP protocol
  - Sensors acquisition
  - Data transmission each 10 seconds to aircasting smartphone app
  
- * Aircasting protocol
+## Aircasting protocol
  
-Each sensor reading should be written as one line to the serial output. Lines should end with '\n' and should have the following format:
+Each sensor reading should be written as one line to the serial output. Lines should end with '\\n' and should have the following format:
 
-<Measurement value>;<Sensor package name>;<Sensor name>;<Type of measurement>;<Short type of measurement>;<Unit name>;<Unit symbol/abbreviation>;<T1>;<T2>;<T3>;<T4>;<T5>
+\<Measurement value\>;\<Sensor package name\>;\<Sensor name\>;\<Type of measurement\>;\<Short type of measurement\>;\<Unit name\>;\<Unit symbol/abbreviation\>;\<T1\>;\<T2\>;\<T3\>;\<T4\>;\<T5\>
 
 The Sensor name should be different for each sensor.
 
- <Sensor package name> = AirPoll + BT MAC address
- <Sensor name> = AirPoll-CH4 / AirPoll-PM1 / AirPoll-C
- <Type of measurement>;<Short type of measurement> = Methane;CH4 Gas / Particulate Matter;PM / Temperature;C / Humidity;RH
- <Unit name>;<Unit symbol/abbreviation> = response indicator;RI / degrees Celsius;C / percent;%
+ \<Sensor package name\> = AirPoll + BT MAC address
+ 
+ \<Sensor name\> = AirPoll-CH4 / AirPoll-PM1 / AirPoll-C
+ 
+ \<Type of measurement\>;\<Short type of measurement\> = Methane;CH4 Gas / Particulate Matter;PM / Temperature;C / Humidity;RH
+ 
+ \<Unit name\>;\<Unit symbol/abbreviation\> = response indicator;RI / degrees Celsius;C / percent;%
 
 T1..T5 are integer thresholds which guide how values should be displayed -
 - lower than T1 - extremely low / won't be displayed
