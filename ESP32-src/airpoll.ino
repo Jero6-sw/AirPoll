@@ -1,19 +1,21 @@
 /*
-  Pollution v02
+  AirPoll
 
-  Gestion shield pollution avec :
-   - capteur NO2 (Ain0)
-   - temperature (DS18B20 on In2)
-   - Dust (DSM501A on In3-4)
+  Board ESP32-WROOM-32
 
-  modified x xxx 201x
-  by 
+  Shield pollution management with :
+   - capteur NO2 (TGS2611)
+   - temperature (DS18B20)
+   - Dust 1um et 2.5um (DSM501A)
+
+  Bluetooth Communication with Aircasting application.
+
+  modified 22/11/2020 by J.Galy
   
  
-  Communication bluetooth avec un ESP32.
 
-*/
-/*
+ ---- Note : Aircasting protocol
+
 Each sensor reading should be written as one line to the serial output. Lines should end
 with '\n' and should have the following format:
 
@@ -30,6 +32,8 @@ T1..T5 are integer thresholds which guide how values should be displayed -
 - higher than T5 - extremely high / won't be displayed
 */
 
+String Version = "03a";
+
 
 #include <OneWire.h> 
 #include <DallasTemperature.h>
@@ -37,54 +41,101 @@ T1..T5 are integer thresholds which guide how values should be displayed -
 #include "esp_bt_device.h"
 #include "Strings.h"
 
-//#include "Arduino.h"
-//#include <ESP32AnalogRead.h>
-//ESP32AnalogRead adc;
+#include <Wire.h>
+#include <ADS1115_WE.h>
+#define I2C_ADDRESS 0x48
 
 
+String aStr;
+
+/********************************************************************/
+// Pins assignment
+/********************************************************************/
+const int ledPin =  26;// the number of the LED pin
+const int dustPin1 =  33; // DSM501A output 1 (>2.5um particules)
+const int dustPin2 =  32; // DSM501A output 2 (>1.0um particules)
+const int Analog0 =  34; // TGS2611 analog input
 #define ONE_WIRE_BUS 25
+// I²C SDA = GPIO21 for ADS1115
+// I²C SCL = GPIO22 for ADS1115
 
+
+
+/********************************************************************/
+// ADS1115 ADC 4 lanes variables and instances
+/********************************************************************/
+ADS1115_WE adc(I2C_ADDRESS);
+// ADS1115_WE adc = ADS1115_WE(); // Alternative: uses default address 0x48
+
+float voltage=0.0;
+int rawResult;
+
+
+/********************************************************************/
+// Bluetooth
+/********************************************************************/
 BluetoothSerial SerialBT;
-
-/********************************************************************/
-// Setup a oneWire instance to communicate with any OneWire devices  
-// (not just Maxim/Dallas temperature ICs) 
-OneWire oneWire(ONE_WIRE_BUS); 
-/********************************************************************/
-// Pass our oneWire reference to Dallas Temperature. 
-DallasTemperature sensors(&oneWire);
-/********************************************************************/ 
 
 String BTAddress; // BT MAC address
 
-// constants won't change. Used here to set a pin number:
-const int ledPin =  26;// the number of the LED pin
-const int dustPin1 =  33; // DSM501A output 1
-const int dustPin2 =  32; // DSM501A output 2
-const int Analog0 =  34; // TGS2611 analog input
+/********************************************************************/
+// Temperature : DS18B20 sensor through 1-Wire
+/********************************************************************/
 
-// Variables will change:
+OneWire oneWire(ONE_WIRE_BUS); 
+
+DallasTemperature sensors(&oneWire);
+
+float aTemperature;
+
+
+/********************************************************************/
+// LED variables
+/********************************************************************/
 int ledState = LOW;             // ledState used to set the LED
 
-// Generally, you should use "unsigned long" for variables that hold time
-// The value will quickly become too large for an int to store
-unsigned long previousMillis = 0;        // will store last time LED was updated
+/********************************************************************/
+// Dust variables
+/********************************************************************/
+volatile int dust_1 = 0;
+volatile int dust_2 = 0;
+volatile int dust_T = 0;
+int  val_dust_PM1_0 = 0;
+int  val_dust_PM2_5 = 0;
 
-// constants won't change:
-//const long interval = 1000;           // interval at which to blink (milliseconds)
+hw_timer_t *timer = NULL; // Timer for dust count
+// It trigs every 1ms, counting the ratio between a low value of the dust pin
+// and the total time -> percent value which can be converted into a dust quantity
 
-
-unsigned long interval = 1000;           // interval at which to blink (milliseconds)
-
+/********************************************************************/
+// Analog variables
+/********************************************************************/
 int AnalogVal = 0;           // variable to store the value read
 unsigned long DurVal = 0;
 
+/********************************************************************/
+// Timing variables
+/********************************************************************/
 const unsigned long CINTERVAL=10; // seconds between 2 saves
+
+unsigned long currentSavedMillis = 0;
 unsigned long previousSavedMillis = 0;
 
-volatile int state = 0;
 
 
+
+
+
+
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+// Sub funstions, Interrupt functions
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+
+/********************************************************************/
+// BT event
+/********************************************************************/
 void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
   if(event == ESP_SPP_SRV_OPEN_EVT){
     Serial.println("Client Connected");
@@ -95,6 +146,9 @@ void callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param){
   }
 }
 
+/********************************************************************/
+// BT address
+/********************************************************************/
 String getBTDeviceAddress() {
  
   const uint8_t* point = esp_bt_dev_get_address();
@@ -113,26 +167,73 @@ String getBTDeviceAddress() {
   }
   return Stmp;
 }
- 
+
+/********************************************************************/
+// Dust interruption rotine (timer 1ms)
+/********************************************************************/
+void interrupt_dust() {
+
+    dust_T=dust_T+1;
+    if (digitalRead(dustPin1) == LOW)
+       dust_1=dust_1+1;
+    if (digitalRead(dustPin2) == LOW)
+       dust_2=dust_2+1;
+}
+
+
+/********************************************************************/
+// ADS1115 read analog lane
+/********************************************************************/
+float readChannel(ADS1115_MUX channel) {
+  float voltage = 0.0;
+  adc.setCompareChannels(channel);
+  adc.startSingleMeasurement();
+  while(adc.isBusy()){}
+  voltage = adc.getResult_mV();
+  rawResult = adc.getRawResult();
+  return voltage;
+}
+
+/********************************************************************/
+// Sensors conversion functions
+/********************************************************************/
+// DSM501A theory, ratio is between 10000 and 14000 (low ratio -> ug/m3)
+int conv_DSM501A_PM2_5(int dust_low, int dust_Total) {
+  float particule_concentration = (float)(dust_low)*12000.0/(float)(dust_Total);
+  return (int)(particule_concentration);
+}
+
+// DSM501A theory, ratio is between 10000 and 14000 (low ratio -> ug/m3)
+int conv_DSM501A_PM1_0(int dust_low, int dust_Total) {
+  float particule_concentration = (float)(dust_low)*12000.0/(float)(dust_Total);
+  return (int)(particule_concentration);
+}
+
+
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+// Setup
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+
 void setup() {
-   // initialize digital pin LED_BUILTIN as an output.
+
+   aStr = String();
+
+   // initialize GPIOs
    pinMode(ledPin, OUTPUT);
 
    pinMode(dustPin1, INPUT);
    pinMode(dustPin2, INPUT);
 
-/*
-  pinMode(Analog0,INPUT);
-  adcAttachPin(Analog0);
-  analogReadResolution(11);
-  analogSetAttenuation(ADC_6db);
-*/
-//adc.attach(4);
+   // I2C initialization (ADS1115)
+   Wire.begin();
 
-  
+   // Debug port COM
    Serial.begin(115200);
 
-   Serial.println("Module AirPoll. Test v02e");
+  aStr = "Module AirPoll. Test v" + Version;
+   Serial.println(aStr);
    Serial.println("------------------------");
 
   SerialBT.register_callback(callback);
@@ -143,46 +244,125 @@ void setup() {
     BTAddress=getBTDeviceAddress();
     Serial.println("Bluetooth initialized (" + BTAddress + ")");
     
-   attachInterrupt(digitalPinToInterrupt(dustPin1), dust, FALLING);
+  timer = timerBegin(0, 80, true);                  //timer 0, div 80
+  timerAttachInterrupt(timer, &interrupt_dust, true);  //attach callback
+  timerAlarmWrite(timer, 1000, true); // Time in microseconds
+  timerAlarmEnable(timer);
 
+  if(!adc.init()){
+    Serial.println("ADS1115 not connected!");
+  }
+
+  /* Set the voltage range of the ADC to adjust the gain
+   * Please note that you must not apply more than VDD + 0.3V to the input pins!
+   * 
+   * ADS1115_RANGE_6144  ->  +/- 6144 mV
+   * ADS1115_RANGE_4096  ->  +/- 4096 mV
+   * ADS1115_RANGE_2048  ->  +/- 2048 mV (default)
+   * ADS1115_RANGE_1024  ->  +/- 1024 mV
+   * ADS1115_RANGE_0512  ->  +/- 512 mV
+   * ADS1115_RANGE_0256  ->  +/- 256 mV
+   */
+  adc.setVoltageRange_mV(ADS1115_RANGE_2048); //comment line/change parameter to change range
+
+  /* Set the inputs to be compared
+   *  
+   *  ADS1115_COMP_0_1    ->  compares 0 with 1 (default)
+   *  ADS1115_COMP_0_3    ->  compares 0 with 3
+   *  ADS1115_COMP_1_3    ->  compares 1 with 3
+   *  ADS1115_COMP_2_3    ->  compares 2 with 3
+   *  ADS1115_COMP_0_GND  ->  compares 0 with GND
+   *  ADS1115_COMP_1_GND  ->  compares 1 with GND
+   *  ADS1115_COMP_2_GND  ->  compares 2 with GND
+   *  ADS1115_COMP_3_GND  ->  compares 3 with GND
+   */
+  //adc.setCompareChannels(ADS1115_COMP_0_GND); //uncomment if you want to change the default
+
+  /* Set number of conversions after which the alert pin will be active
+   * - or you can disable the alert 
+   *  
+   *  ADS1115_ASSERT_AFTER_1  -> after 1 conversion
+   *  ADS1115_ASSERT_AFTER_2  -> after 2 conversions
+   *  ADS1115_ASSERT_AFTER_4  -> after 4 conversions
+   *  ADS1115_DISABLE_ALERT   -> disable comparator / alert pin (default) 
+   */
+  //adc.setAlertPinMode(ADS1115_ASSERT_AFTER_1); //uncomment if you want to change the default
+
+  /* Set the conversion rate in SPS (samples per second)
+   * Options should be self-explaining: 
+   * 
+   *  ADS1115_8_SPS 
+   *  ADS1115_16_SPS  
+   *  ADS1115_32_SPS 
+   *  ADS1115_64_SPS  
+   *  ADS1115_128_SPS (default)
+   *  ADS1115_250_SPS 
+   *  ADS1115_475_SPS 
+   *  ADS1115_860_SPS 
+   */
+  //adc.setConvRate(ADS1115_8_SPS); //uncomment if you want to change the default
+
+  /* Set continuous or single shot mode:
+   * 
+   *  ADS1115_CONTINUOUS  ->  continuous mode
+   *  ADS1115_SINGLE     ->  single shot mode (default)
+   */
+  //adc.setMeasureMode(ADS1115_CONTINUOUS); //uncomment if you want to change the default
+
+   /* Choose maximum limit or maximum and minimum alert limit (window)in Volt - alert pin will 
+   *  be active when measured values are beyond the maximum limit or outside the window 
+   *  Upper limit first: setAlertLimit_V(MODE, maximum, minimum)
+   *  In max limit mode the minimum value is the limit where the alert pin will be deactivated (if 
+   *  not latched)  
+   * 
+   *  ADS1115_MAX_LIMIT
+   *  ADS1115_WINDOW
+   * 
+   */
+  //adc.setAlertModeAndLimit_V(ADS1115_MAX_LIMIT, 3.0, 1.5); //uncomment if you want to change the default
+  
+  /* Enable or disable latch. If latch is enabled the alarm pin will be active until the
+   * conversion register is read (getResult functions). If disabled the alarm pin will be
+   * deactivated with next value within limits. 
+   *  
+   *  ADS1115_LATCH_DISABLED (default)
+   *  ADS1115_LATCH_ENABLED
+   */
+  //adc.setAlertLatch(ADS1115_LATCH_ENABLED); //uncomment if you want to change the default
+
+  /* Sets the alert pin polarity if active:
+   *  
+   * Enable or disable latch. If latch is enabled the alarm pin will be active until the
+   * conversion register is read (getResult functions). If disabled the alarm pin will be
+   * deactivated with next value within limits. 
+   *  
+   * ADS1115_ACT_LOW  ->  active low (default)   
+   * ADS1115_ACT_HIGH ->  active high
+   */
+  //adc.setAlertPol(ADS1115_ACT_LOW); //uncomment if you want to change the default
+ 
+  /* With this function the alert pin will be active, when a conversion is ready.
+   * In order to deactivate, use the setAlertLimit_V function  
+   */
+  //adc.setAlertPinToConversionReady(); //uncomment if you want to change the default
+
+  Serial.println("ADS1115 - Single Shot Mode");
    
   }
 }
 
 
-void dust() {
-    state = state + 1;
-}
 
 
 
-
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+// Main Loop
+// ------------------------------------------------------------------------
+// ------------------------------------------------------------------------
 void loop() {
-   unsigned long currentMillis = millis();
-   unsigned long currentSavedMillis = millis();
+   currentSavedMillis = millis();
    int i;
-
-/*
-   // ---------------------------------------
-   // Gestion LED
-   if (currentMillis - previousMillis >= interval) {
-      // save the last time you blinked the LED
-      previousMillis = currentMillis;
-
-      // if the LED is off turn it on and vice-versa:
-      if (ledState == LOW) {
-         ledState = HIGH;
-         interval = 50;
-         }
-      else {
-         ledState = LOW;
-         interval = 950;
-         }
-
-      // set the LED with the ledState of the variable:
-      digitalWrite(ledPin, ledState);
-      }
-*/
 
    // ---------------------------------------
    // Gestion sauvegarde voie analogique
@@ -203,22 +383,74 @@ void loop() {
       //SavedAnalogVal[indexSaved] = byte(analogRead(0));
   //SerialBT.print(adc.readVoltage()); //analogRead(Analog0));
   AnalogVal=analogRead(Analog0);
-  SerialBT.print(AnalogVal);
-    //Serial.print(AnalogVal);
-    //Serial.print("$");
+    Serial.print("A0=");
+    Serial.print(AnalogVal);
+    Serial.print("\t");
+
+  voltage = readChannel(ADS1115_COMP_0_GND);
+    Serial.print("ADS1115:");
+    Serial.print(voltage);
+  SerialBT.print(voltage-900.0);
+    Serial.print("(");
+    Serial.print(rawResult);
+    Serial.print(")");
+  voltage = readChannel(ADS1115_COMP_1_GND);
+    Serial.print("-");
+    Serial.print(voltage);
+  voltage = readChannel(ADS1115_COMP_2_GND);
+    Serial.print("-");
+    Serial.print(voltage);
+  voltage = readChannel(ADS1115_COMP_3_GND);
+    Serial.print("-");
+    Serial.print(voltage);
+    Serial.print("\t");
 
   SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-CH4;Methane;CH4 Gas;response indicator;RI;0;25;50;75;100");
   SerialBT.print("\n");
-      //SavedDigVal[indexSaved] = byte(state);
-  SerialBT.print(state);
-  SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-PM1;Particulate Matter;PM;response indicator;RI;0;25;50;75;100");
+    Serial.print("!");
+    Serial.print(dust_1);
+    Serial.print("-");
+    Serial.print(dust_2);
+    Serial.print("-");
+    Serial.print(dust_T);
+    Serial.print("\t");
+
+  val_dust_PM2_5 = 100*dust_1/dust_T;
+  val_dust_PM1_0 = 100*dust_2/dust_T;
+//  SerialBT.print(val_dust_PM1_0);
+//  SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-PM1;Particulate Matter;PM;response indicator;RI;0;25;50;75;100");
+//  SerialBT.print("\n");
+    Serial.print("PM1=");
+    Serial.print(val_dust_PM1_0);
+    Serial.print("\t");
+
+//   SerialBT.print(val_dust_PM2_5);
+//  SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-PM2.5;Particulate Matter;PM;response indicator;RI;0;25;50;75;100");
+//  SerialBT.print("\n");
+    Serial.print("PM2.5=");
+    Serial.print(val_dust_PM2_5);
+    Serial.print("\t");
+
+  SerialBT.print(conv_DSM501A_PM1_0(dust_2,dust_T));
+  SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-PM1;Particulate Matter;PM;micrograms per cubic meter;µg/m³;0;12;35;55;150");
   SerialBT.print("\n");
-      state=0;
+  SerialBT.print(conv_DSM501A_PM2_5(dust_1,dust_T));
+  SerialBT.print(";AirPoll:" + BTAddress + ";AirPoll-PM2.5;Particulate Matter;PM;micrograms per cubic meter;µg/m³;0;12;35;55;150");
+  SerialBT.print("\n");
+      dust_T=0;
+      dust_1=0;
+      dust_2=0;
+
+
       sensors.requestTemperatures(); // Send the command to get temperature readings 
       //SavedTmpVal[indexSaved] = byte(10*sensors.getTempCByIndex(0)-100);
-  SerialBT.print(sensors.getTempCByIndex(0));
+      aTemperature=sensors.getTempCByIndex(0);
+  SerialBT.print((int)aTemperature);
   SerialBT.print(";Airpoll:" + BTAddress + ";AirPoll-C;Temperature;C;degrees Celsius;C;-5;5;15;25;35");
   SerialBT.print("\n");
+    Serial.print("T=");
+    Serial.print(aTemperature);
+    Serial.print("°C\r");
       }
 
   
